@@ -1,19 +1,15 @@
 # Cluster Autoscaler on Huawei Cloud 
 
 ## Overview
-The cluster autoscaler for [Huawei ServiceStage](https://www.huaweicloud.com/intl/en-us/product/servicestage.html) scales worker nodes within any
-specified container cluster's node pool where the `Autoscaler` label is on. 
+The cluster autoscaler for [Huawei ServiceStage](https://www.huaweicloud.com/intl/en-us/product/servicestage.html) works with self-built Kubernetes cluster on Huaweicloud ECS and
+specified Huaweicloud Auto Scaling Groups. 
 It runs as a Deployment on a worker node in the cluster. This README will go over some of the necessary steps required 
 to get the cluster autoscaler up and running.
 
 Note: 
 
 1. Cluster autoscaler must be run on a version of Huawei container engine 1.15.6 or later.
-2. Node pool attached to the cluster must have the `Autoscaler` flag turned on, and minimum number of nodes and maximum
-number of nodes being set. Node pools can be managed by `Resource Management` from Huawei container engine console.
-3. If warnings about installing `autoscaler addon` are encountered after creating a node pool with `Autoscaler` flag on, 
-just ignore this warning and DO NOT install the addon.
-4. Do not build your image in a Huawei Cloud ECS. Build the image in a machine that has access to the Google Container Registry (GCR).
+2. Do not build your auto scaler image in a Huawei Cloud ECS. Build the image in a machine that has access to the Google Container Registry (GCR).
 
 ## Deployment Steps
 ### Build Image
@@ -76,10 +72,133 @@ The following steps use Huawei SoftWare Repository for Container (SWR) as an exa
    
 5. For the cluster autoscaler to function normally, make sure the `Sharing Type` of the image is `Public`.
     If the cluster has trouble pulling the image, go to SWR console and check whether the `Sharing Type` of the image is 
-    `Private`. If it is, click `Edit` button on top right and set the `Sharing Type` to `Public`.
+    `Private`. If it is, click `Edit` button on top right and set the `Sharing Type` to `Public`.  
+  
 
-### Deploy Cluster Autoscaler
-#### Configure credentials
+## Build Kubernetes Cluster on ECS   
+
+### 1. Installing kubelet, kubeadm and kubectl   
+
+Please see installation [here](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)
+
+For example:
+- OS: CentOS 8
+- Note: The following example should be run on ECS that has access to the Google Container Registry (GCR)
+    ```bash
+    cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+    [kubernetes]
+    name=Kubernetes
+    baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-\$basearch
+    enabled=1
+    gpgcheck=1
+    repo_gpgcheck=1
+    gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/ doc/rpm-package-key.gpg
+    exclude=kubelet kubeadm kubectl
+    EOF
+    ```
+
+    ```
+    sudo setenforce 0
+    sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+
+    sudo yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+
+    sudo systemctl enable --now kubelet
+    ```
+### 2. Installing Docker
+Please see installation [here](https://docs.docker.com/engine/install/)
+
+For example:
+- OS: CentOS 8
+- Note: The following example should be run on ECS that has access to the Google Container Registry (GCR)
+
+    ```bash
+    sudo yum install -y yum-utils
+
+    sudo yum-config-manager \
+        --add-repo \
+        https://download.docker.com/linux/centos/docker-ce.repo
+
+    sudo yum install docker-ce docker-ce-cli containerd.io
+
+    sudo systemctl start docker
+    ```
+
+### 3. Init Cluster
+```bash
+kubeadm init
+
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+### 4. Installing flannel network
+```bash 
+kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+```
+### 5. Generating token
+```bash
+kubeadm token create -ttl 0
+```
+Generating a token that never expired, remember this token it will be used later.
+
+Getting hash key, remember the key it will be used later.
+```
+openssl x509 -in /etc/kubernetes/pki/ca.crt -noout -pubkey | openssl rsa -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1
+```
+
+### 6. Creating OS Image with K8S tools
+- Lunch a new ECS instance, and install Kubeadm, Kubecrtl and docker.
+- Create a script to join the new instance into the k8s cluster.
+    ```bash
+    cat <<EOF >/etc/rc.d/init.d/init-k8s.sh
+    #!bin/bash
+    #chkconfig: 2345 80 90
+    setenforce 0
+    swapoff -a
+
+    yum install -y kubelet
+    systemctl start docker
+
+    kubeadm join --token $TOKEN 192.168.0.31:6443 --discovery-token-ca-cert-hash $HASHKEY
+    EOF
+    ```
+- Add this scripts into chkconfig, to let it run automatically run after the instance is started.
+    ```
+    chmod +x /etc/rc.d/init.d/init-k8s.sh
+    chkconfig --add /etc/rc.d/init.d/init-k8s.sh
+    chkconfig /etc/rc.d/init.d/init-k8s.sh on
+    ```
+- Copy `~/.kube/config` from master node to this ECS `~./kube/config` to setup kubectl on this instance.
+
+- Go to Huawei Cloud `Image Management` Service and click on Create Image. Select type `System disk image`, select your ECS instance as `Source`, then give it a name and create.
+
+- Remember this ECS instance ID, it will be used later.
+
+### 7. Creating AutoScaling Group
+- Follow the Huawei cloud instruction to create a AutoScaling Group.
+- Create an AutoScaling Group Configuration, select private image which we just created.
+- While creating the AutoScaling Group Configuration, add the following scripts into advance setting.
+    ```bash
+    #!bin/bash
+
+    IDS=$(ls /var/lib/cloud/instances/)
+    while true
+    do
+        for ID in $IDS
+        do
+            if [ $ID != $ECS_INSTANCE_ID ]; then
+                /usr/bin/kubectl --kubeconfig ~/.kube/config patch node $HOSTNAME -p "{\"spec\":{\"providerID\":\"$ID\"}}"
+            fi
+        done
+    sleep 30
+    done
+    ```
+ - Bind the AutoScaling Group with this config
+
+## Deploy Cluster Autoscaler
+### Configure credentials
 The autoscaler needs a `ServiceAccount` which is granted permissions to the cluster's resources and a `Secret` which 
 stores credential (AK/SK in this case) information for authenticating with Huawei cloud.
     
@@ -97,6 +216,24 @@ The following parameters are required in the Secret object yaml file:
     For example, for region `cn-north-4`, fill in the `identity-endpoint` as
     ```
     identity-endpoint=https://iam.cn-north-4.myhuaweicloud.com/v3.0
+    ```
+
+- `as-endpoint`
+
+    Find the as endpoint for different regions [here](https://developer.huaweicloud.com/endpoint?AS), 
+        
+    For example, for region `cn-north-4`, the endpoint is
+    ```
+    as.cn-north-4.myhuaweicloud.com
+    ```
+
+- `ecs-endpoint`
+
+    Find the ecs endpoint for different regions [here](https://developer.huaweicloud.com/endpoint?ECS), 
+        
+    For example, for region `cn-north-4`, the endpoint is 
+    ```
+    ecs.cn-north-4.myhuaweicloud.com
     ```
 
 - `project-id`
